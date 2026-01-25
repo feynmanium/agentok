@@ -145,6 +145,7 @@ class SegmentResponse(BaseModel):
     confidence: Optional[float] = None
     speaker_confidence: Optional[float] = None
     is_user_verified: bool = False
+    has_overlap: bool = False  # True if overlapping speech detected
     word_timestamps: Optional[List[WordTimestamp]] = None
     speaker: Optional[SpeakerResponse] = None
     created_at: datetime

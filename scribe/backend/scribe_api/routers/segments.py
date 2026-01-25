@@ -198,10 +198,34 @@ async def bulk_label_segments(
         speaker.first_seen_at = datetime.utcnow()
 
     await db.commit()
+
+    # Retrospective Update: scan existing unknown segments and auto-label
+    # any that match the newly labeled speaker with > 0.75 similarity
+    svc = get_speaker_learning_service()
+    auto_labeled_count = 0
+
+    # Get all unique recording IDs from the labeled segments
+    recording_ids = list(set(seg.recording_id for seg in segments))
+
+    for rec_id in recording_ids:
+        try:
+            count = await svc.retrospective_update(
+                speaker_id=speaker.id,
+                recording_id=rec_id,
+                db_session=db,
+            )
+            auto_labeled_count += count
+        except Exception as e:
+            # Log but don't fail the request
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Retrospective update failed for recording {rec_id}: {e}"
+            )
+
     await db.refresh(speaker)
 
     return SpeakerLabelResponse(
-        updated_count=len(segments),
+        updated_count=len(segments) + auto_labeled_count,
         speaker=SpeakerResponse.model_validate(speaker),
     )
 

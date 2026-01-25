@@ -67,6 +67,7 @@ export interface Segment {
   confidence?: number;
   speaker_confidence?: number;
   is_user_verified: boolean;
+  has_overlap: boolean;  // True if overlapping speech detected (> 500ms)
   word_timestamps?: WordTimestamp[];
   speaker?: Speaker;
   created_at: string;

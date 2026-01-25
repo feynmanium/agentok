@@ -12,12 +12,16 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Constants
+# Constants (aligned with SPEC.md)
 EMBEDDING_DIM = 192  # ECAPA-TDNN embedding dimension
-HIGH_CONFIDENCE_THRESHOLD = 0.75
-SUGGESTION_THRESHOLD = 0.60
+HIGH_CONFIDENCE_THRESHOLD = 0.75  # Auto-label threshold
+SUGGESTION_THRESHOLD = 0.60  # Suggest match threshold
+VERY_HIGH_CONFIDENCE_THRESHOLD = 0.85  # Threshold for profile update on auto-match
 MAX_SAMPLES_PER_SPEAKER = 50
-ADAPTATION_RATE = 0.95  # Slow adaptation to prevent drift
+MIN_SEGMENT_DURATION_MS = 1500  # Minimum 1.5s for profile creation (SPEC requirement)
+MIN_SAMPLES_FOR_ACTIVE = 3  # Minimum labeled samples before auto-labeling activates
+ADAPTATION_RATE = 0.95  # Slow adaptation: centroid_new = 0.95 * old + 0.05 * new
+PROFILE_UPDATE_WEIGHT = 0.05  # Weight for updating profile on high-confidence auto-match
 
 
 def embedding_to_bytes(embedding: np.ndarray) -> bytes:
@@ -39,27 +43,48 @@ class SpeakerProfile:
     samples: List[np.ndarray] = field(default_factory=list)
     sample_count: int = 0
     confidence: float = 0.0
+    is_active: bool = False  # Only active profiles can auto-label
 
-    def add_sample(self, embedding: np.ndarray, quality_score: float = 1.0):
-        """Add new embedding sample and update centroid."""
+    @property
+    def can_auto_label(self) -> bool:
+        """Check if profile has enough samples for auto-labeling."""
+        return self.sample_count >= MIN_SAMPLES_FOR_ACTIVE and self.centroid is not None
+
+    def add_sample(self, embedding: np.ndarray, quality_score: float = 1.0, is_user_labeled: bool = True):
+        """
+        Add new embedding sample and update centroid.
+
+        Args:
+            embedding: Voice embedding to add
+            quality_score: Quality score (0-1)
+            is_user_labeled: Whether this came from user labeling (trusted) or auto-match
+        """
         # Normalize embedding
         embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
 
-        # Add to samples
-        self.samples.append(embedding)
-        self.sample_count += 1
+        # Only add to samples if user-labeled (prevents pollution from auto-matches)
+        if is_user_labeled:
+            self.samples.append(embedding)
+            self.sample_count += 1
 
-        # Prune if too many samples
-        if len(self.samples) > MAX_SAMPLES_PER_SPEAKER:
-            self._prune_samples()
+            # Prune if too many samples
+            if len(self.samples) > MAX_SAMPLES_PER_SPEAKER:
+                self._prune_samples()
 
-        # Update centroid with exponential moving average
+        # Update centroid based on label source
         if self.centroid is None:
             self.centroid = embedding.copy()
         else:
+            if is_user_labeled:
+                # User-labeled: normal adaptation rate
+                weight = 1 - ADAPTATION_RATE  # 0.05
+            else:
+                # Auto-match: very conservative update (prevents drift)
+                weight = PROFILE_UPDATE_WEIGHT  # 0.05
+
             self.centroid = (
-                ADAPTATION_RATE * self.centroid +
-                (1 - ADAPTATION_RATE) * embedding
+                (1 - weight) * self.centroid +
+                weight * embedding
             )
 
         # Normalize centroid
@@ -67,6 +92,9 @@ class SpeakerProfile:
 
         # Update confidence based on sample count
         self.confidence = min(1.0, self.sample_count / 20)
+
+        # Update active status
+        self.is_active = self.can_auto_label
 
     def _prune_samples(self):
         """Remove most similar samples to maintain diversity."""
@@ -185,15 +213,17 @@ class SpeakerMatcher:
     def find_matches(
         self,
         embedding: np.ndarray,
-    ) -> List[Tuple[str, str, float, str]]:
+        include_inactive: bool = True,
+    ) -> List[Tuple[str, str, float, str, bool]]:
         """
         Find matching speakers for an unknown embedding.
 
         Args:
             embedding: Voice embedding to match
+            include_inactive: Include profiles that can't yet auto-label
 
         Returns:
-            List of (speaker_id, speaker_name, similarity, confidence_level)
+            List of (speaker_id, speaker_name, similarity, confidence_level, can_auto_label)
             sorted by similarity descending
         """
         # Normalize input embedding
@@ -202,6 +232,9 @@ class SpeakerMatcher:
         matches = []
         for profile in self.profiles.values():
             if profile.centroid is None:
+                continue
+
+            if not include_inactive and not profile.can_auto_label:
                 continue
 
             similarity = float(np.dot(embedding, profile.centroid))
@@ -217,6 +250,7 @@ class SpeakerMatcher:
                     profile.name,
                     similarity,
                     confidence,
+                    profile.can_auto_label,
                 ))
 
         # Sort by similarity descending
@@ -226,19 +260,24 @@ class SpeakerMatcher:
     def identify_speaker(
         self,
         embedding: np.ndarray,
+        require_active: bool = True,
     ) -> Optional[Tuple[str, str, float]]:
         """
         Automatically identify speaker if confidence is high enough.
 
         Args:
             embedding: Voice embedding to identify
+            require_active: Only match against active profiles (>= 3 samples)
 
         Returns:
             (speaker_id, speaker_name, similarity) if confident, None otherwise
         """
-        matches = self.find_matches(embedding)
+        matches = self.find_matches(embedding, include_inactive=not require_active)
 
-        if matches and matches[0][3] == "high":
+        # Only auto-identify if:
+        # 1. High confidence match exists
+        # 2. Profile is active (has >= MIN_SAMPLES_FOR_ACTIVE samples)
+        if matches and matches[0][3] == "high" and matches[0][4]:
             return (matches[0][0], matches[0][1], matches[0][2])
 
         return None
@@ -290,6 +329,7 @@ class SpeakerLearningService:
                 samples=samples,
                 sample_count=speaker.sample_count,
                 confidence=speaker.confidence,
+                is_active=speaker.sample_count >= MIN_SAMPLES_FOR_ACTIVE,
             )
             profiles.append(profile)
             self._profiles_cache[speaker.id] = profile
@@ -315,12 +355,12 @@ class SpeakerLearningService:
         self,
         embedding: np.ndarray,
         db_session,
-    ) -> List[Tuple[str, str, float, str]]:
+    ) -> List[Tuple[str, str, float, str, bool]]:
         """
         Get speaker suggestions for an unknown embedding.
 
         Returns:
-            List of (speaker_id, speaker_name, similarity, confidence) matches
+            List of (speaker_id, speaker_name, similarity, confidence, can_auto_label) matches
         """
         profiles = await self.load_profiles(db_session)
         matcher = SpeakerMatcher(profiles)
@@ -481,9 +521,19 @@ class SpeakerLearningService:
         self,
         recording_id: str,
         db_session,
+        target_speaker_id: Optional[str] = None,
     ) -> int:
         """
         Re-run speaker matching for unidentified segments in a recording.
+
+        This is the **Retrospective Update** feature from the spec.
+        When a user labels a speaker, we scan existing unknown segments
+        and auto-label them if they match > 0.75.
+
+        Args:
+            recording_id: Recording to scan
+            db_session: Database session
+            target_speaker_id: If provided, only match against this speaker (used in retrospective update)
 
         Returns:
             Number of segments that were auto-matched
@@ -496,9 +546,16 @@ class SpeakerLearningService:
         if not profiles:
             return 0
 
+        # If targeting specific speaker, filter profiles
+        if target_speaker_id:
+            profiles = [p for p in profiles if p.id == target_speaker_id]
+            if not profiles:
+                return 0
+
         matcher = SpeakerMatcher(profiles)
 
         # Get unidentified segments with embeddings
+        # Also check segment duration >= MIN_SEGMENT_DURATION_MS
         stmt = select(Segment).where(
             Segment.recording_id == recording_id,
             Segment.speaker_id.is_(None),
@@ -509,15 +566,50 @@ class SpeakerLearningService:
 
         matched_count = 0
         for segment in segments:
+            # Check duration meets minimum threshold
+            duration_ms = segment.end_ms - segment.start_ms
+            if duration_ms < MIN_SEGMENT_DURATION_MS:
+                continue
+
             embedding = bytes_to_embedding(segment.embedding)
-            match = matcher.identify_speaker(embedding)
+            match = matcher.identify_speaker(embedding, require_active=True)
 
             if match:
                 speaker_id, speaker_name, similarity = match
                 segment.speaker_id = speaker_id
                 segment.speaker_confidence = similarity
-                segment.is_user_verified = False
+                segment.is_user_verified = False  # Auto-labeled, not user-labeled
                 matched_count += 1
+
+                # For very high confidence matches, update the profile (slow drift)
+                if similarity >= VERY_HIGH_CONFIDENCE_THRESHOLD:
+                    profile = self._profiles_cache.get(speaker_id)
+                    if profile:
+                        profile.add_sample(embedding, is_user_labeled=False)
 
         await db_session.commit()
         return matched_count
+
+    async def retrospective_update(
+        self,
+        speaker_id: str,
+        recording_id: str,
+        db_session,
+    ) -> int:
+        """
+        Perform retrospective update after labeling a speaker.
+
+        Scans all unknown segments in the recording and auto-labels
+        any that match the newly labeled speaker with > 0.75 similarity.
+
+        This ensures labeling "Speaker A" as "Bill" at the end of a
+        recording fixes all previous occurrences.
+
+        Returns:
+            Number of segments auto-labeled
+        """
+        return await self.rematch_unidentified_segments(
+            recording_id=recording_id,
+            db_session=db_session,
+            target_speaker_id=speaker_id,
+        )

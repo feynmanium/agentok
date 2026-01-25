@@ -266,43 +266,101 @@ function SegmentCard({
   const speakerName = segment.speaker?.name || segment.temp_speaker_id || 'Unknown';
   const speakerColor = segment.speaker?.color || '#6B7280';
   const isLabeled = !!segment.speaker_id;
+  const isUserVerified = segment.is_user_verified;
+  const isAutoLabeled = isLabeled && !isUserVerified;
+  const hasOverlap = segment.has_overlap;
+
+  // Per SPEC.md Appendix A:
+  // - Manually labeled: solid color bar
+  // - Auto-labeled: dashed border, "auto-labeled" badge
+  // - Unknown: orange color, "Label" button
+  // - Overlap: warning indicator
 
   return (
-    <div className="flex gap-3 group">
+    <div
+      className={cn(
+        'flex gap-3 group rounded-lg p-2 -mx-2 transition-colors',
+        hasOverlap && 'bg-orange-50/50',
+        isAutoLabeled && 'border border-dashed border-muted-foreground/30'
+      )}
+    >
       {/* Timestamp */}
       <div className="text-xs text-muted-foreground w-14 pt-1 flex-shrink-0">
         {formatTimestamp(segment.start_ms)}
       </div>
 
+      {/* Speaker color bar - solid for user-verified, dashed for auto */}
+      <div
+        className={cn(
+          'w-1 rounded-full flex-shrink-0',
+          isUserVerified ? '' : isAutoLabeled ? 'border border-dashed' : ''
+        )}
+        style={{
+          backgroundColor: isUserVerified ? speakerColor : 'transparent',
+          borderColor: isAutoLabeled ? speakerColor : undefined,
+        }}
+      />
+
       {/* Content */}
       <div className="flex-1">
         {/* Speaker Header */}
-        <div className="flex items-center gap-2 mb-1">
+        <div className="flex items-center gap-2 mb-1 flex-wrap">
           <span
             className="inline-flex items-center gap-1.5 text-sm font-medium"
             style={{ color: speakerColor }}
           >
             <span
-              className="w-2 h-2 rounded-full"
-              style={{ backgroundColor: speakerColor }}
+              className={cn(
+                'w-2 h-2 rounded-full',
+                isAutoLabeled && 'border border-current bg-transparent'
+              )}
+              style={{
+                backgroundColor: isAutoLabeled ? 'transparent' : speakerColor,
+              }}
             />
             {speakerName}
           </span>
 
-          {isLabeled ? (
-            <CheckCircle className="w-3 h-3 text-green-500" />
-          ) : onLabelClick ? (
+          {/* Status indicators */}
+          {isUserVerified && (
+            <span className="inline-flex items-center gap-1 text-xs text-green-600">
+              <CheckCircle className="w-3 h-3" />
+              <span className="hidden sm:inline">verified</span>
+            </span>
+          )}
+
+          {isAutoLabeled && (
+            <span className="inline-flex items-center text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+              auto-labeled
+            </span>
+          )}
+
+          {hasOverlap && (
+            <span className="inline-flex items-center gap-1 text-xs text-orange-600">
+              <AlertCircle className="w-3 h-3" />
+              <span className="hidden sm:inline">overlap</span>
+            </span>
+          )}
+
+          {!isLabeled && onLabelClick && (
             <button
               onClick={onLabelClick}
               className="text-xs text-primary hover:underline opacity-0 group-hover:opacity-100 transition-opacity"
             >
               Label speaker
             </button>
-          ) : null}
+          )}
         </div>
 
         {/* Text */}
         <p className="text-sm leading-relaxed">{segment.text}</p>
+
+        {/* Confidence indicator for auto-labeled */}
+        {isAutoLabeled && segment.speaker_confidence && (
+          <div className="mt-1 text-xs text-muted-foreground">
+            {Math.round(segment.speaker_confidence * 100)}% confidence
+          </div>
+        )}
       </div>
     </div>
   );

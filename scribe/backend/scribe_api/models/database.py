@@ -119,7 +119,8 @@ class Segment(Base):
     end_ms = Column(Integer, nullable=False)
     confidence = Column(Float, nullable=True)
     speaker_confidence = Column(Float, nullable=True)
-    is_user_verified = Column(Boolean, default=False)
+    is_user_verified = Column(Boolean, default=False)  # True if user manually labeled this segment
+    has_overlap = Column(Boolean, default=False)  # True if overlapping speech detected (> 500ms)
     embedding = Column(LargeBinary, nullable=True)  # Voice embedding for this segment
     word_timestamps = Column(JSON, nullable=True)  # Array of {word, start_ms, end_ms}
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -165,9 +166,12 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
 
 
-# Enable foreign keys for SQLite
+# Enable foreign keys and WAL mode for SQLite
+# WAL mode provides better concurrency for reads during writes
 @event.listens_for(engine.sync_engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA journal_mode=WAL")  # Better concurrent access
+    cursor.execute("PRAGMA busy_timeout=5000")  # 5 second timeout for locks
     cursor.close()

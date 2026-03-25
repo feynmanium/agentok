@@ -2,266 +2,115 @@ package edqlite
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Config represents the full YAML configuration for an EDQ Lite instance.
-type Config struct {
-	Broker  BrokerConfig  `yaml:"broker"`
-	Agents  []AgentConfig `yaml:"agents,omitempty"`
-	Routes  []RouteConfig `yaml:"routes,omitempty"`
-	Rules   []RuleConfig  `yaml:"rules,omitempty"`
-	HTTP    HTTPConfig    `yaml:"http,omitempty"`
+// RulePack represents a versioned collection of data-quality rules for a
+// single dataset, loaded from YAML configuration.
+type RulePack struct {
+	Version     string                 `yaml:"version"`
+	DatasetID   string                 `yaml:"dataset_id"`
+	Entity      string                 `yaml:"entity"`
+	Owner       string                 `yaml:"owner"`
+	Tags        []string               `yaml:"tags,omitempty"`
+	SLA         SLAConfig              `yaml:"sla,omitempty"`
+	Rules       []Rule                 `yaml:"rules"`
+	Environment map[string]EnvOverride `yaml:"environment,omitempty"`
 }
 
-// BrokerConfig is the YAML broker section.
-type BrokerConfig struct {
-	QueueDepth int `yaml:"queue_depth,omitempty"`
-	Workers    int `yaml:"workers,omitempty"`
+// SLAConfig holds service-level agreement targets for a rule pack.
+type SLAConfig struct {
+	BatchWindowMin int    `yaml:"batch_window_min,omitempty"`
+	RTLatencyMs    int    `yaml:"rt_latency_ms,omitempty"`
+	AlertChannel   string `yaml:"alert_channel,omitempty"`
 }
 
-// AgentConfig is the YAML agent section.
-type AgentConfig struct {
-	Name       string `yaml:"name"`
-	Type       string `yaml:"type"`
-	ChatID     string `yaml:"chat_id,omitempty"`
-	BufferSize int    `yaml:"buffer_size,omitempty"`
+// EnvOverride allows per-environment threshold overrides and rule disabling.
+type EnvOverride struct {
+	ThresholdOverrides map[string]float64 `yaml:"threshold_overrides,omitempty"`
+	Disabled           []string           `yaml:"disabled,omitempty"`
 }
 
-// RouteConfig is the YAML route section.
-type RouteConfig struct {
-	Source    string `yaml:"source"`
-	Target   string `yaml:"target,omitempty"`
-	Topic    string `yaml:"topic"`
-	Broadcast bool  `yaml:"broadcast,omitempty"`
-}
-
-// RuleConfig is the YAML rule section.
-type RuleConfig struct {
-	Name           string   `yaml:"name"`
-	Type           string   `yaml:"type"` // "filter_by_type", "filter_by_sender", "max_content_length", "priority_boost", "metadata_enrich", "conditional_route"
-	AllowedTypes   []string `yaml:"allowed_types,omitempty"`
-	AllowedSenders []string `yaml:"allowed_senders,omitempty"`
-	MaxLength      int      `yaml:"max_length,omitempty"`
-	BoostPriority  int      `yaml:"boost_priority,omitempty"`
-	BoostTypes     []string `yaml:"boost_types,omitempty"`
-	Enrichments    map[string]any `yaml:"enrichments,omitempty"`
-	RouteTo        string   `yaml:"route_to,omitempty"`
-	RouteTypes     []string `yaml:"route_types,omitempty"`
-}
-
-// HTTPConfig is the YAML HTTP server section.
-type HTTPConfig struct {
-	Addr string `yaml:"addr,omitempty"`
-}
-
-// CircuitBreakerYAMLConfig is the YAML circuit breaker section.
-type CircuitBreakerYAMLConfig struct {
-	MaxFailures         int    `yaml:"max_failures,omitempty"`
-	ResetTimeoutSeconds int    `yaml:"reset_timeout_seconds,omitempty"`
-	HalfOpenMaxAttempts int    `yaml:"half_open_max_attempts,omitempty"`
-}
-
-// LoadConfig reads and parses a YAML configuration file.
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+// LoadRulePack reads YAML from r, unmarshals it into a RulePack, and
+// validates every rule before returning.
+func LoadRulePack(r io.Reader) (*RulePack, error) {
+	data, err := io.ReadAll(r)
 	if err != nil {
-		return nil, fmt.Errorf("config: read %s: %w", path, err)
+		return nil, fmt.Errorf("config: reading input: %w", err)
 	}
-	return ParseConfig(data)
-}
 
-// ParseConfig parses YAML data into a Config.
-func ParseConfig(data []byte) (*Config, error) {
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("config: parse: %w", err)
+	var rp RulePack
+	if err := yaml.Unmarshal(data, &rp); err != nil {
+		return nil, fmt.Errorf("config: parsing YAML: %w", err)
 	}
-	if err := cfg.Validate(); err != nil {
+
+	if err := rp.Validate(); err != nil {
 		return nil, err
 	}
-	return &cfg, nil
+
+	return &rp, nil
 }
 
-// Validate checks the configuration for errors.
-func (c *Config) Validate() error {
-	if c.Broker.QueueDepth < 0 {
-		return fmt.Errorf("config: broker.queue_depth must be >= 0")
+// LoadRulePackFile opens the file at path and loads it as a RulePack.
+func LoadRulePackFile(path string) (*RulePack, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: opening file: %w", err)
 	}
-	if c.Broker.Workers < 0 {
-		return fmt.Errorf("config: broker.workers must be >= 0")
+	defer f.Close()
+
+	return LoadRulePack(f)
+}
+
+// ApplyEnvironment applies the overrides for the given environment name.
+// Threshold overrides update matching rules by rule ID; disabled rule IDs
+// are removed from the pack entirely. If env is not found in the Environment
+// map, ApplyEnvironment is a no-op.
+func (rp *RulePack) ApplyEnvironment(env string) {
+	override, ok := rp.Environment[env]
+	if !ok {
+		return
 	}
 
-	agentNames := make(map[string]bool)
-	for i, a := range c.Agents {
-		if a.Name == "" {
-			return fmt.Errorf("config: agents[%d].name is required", i)
-		}
-		if agentNames[a.Name] {
-			return fmt.Errorf("config: duplicate agent name %q", a.Name)
-		}
-		agentNames[a.Name] = true
+	// Build an index of rules by ID for threshold patching.
+	ruleIndex := make(map[string]*Rule, len(rp.Rules))
+	for i := range rp.Rules {
+		ruleIndex[rp.Rules[i].RuleID] = &rp.Rules[i]
 	}
 
-	for i, r := range c.Routes {
-		if r.Source == "" {
-			return fmt.Errorf("config: routes[%d].source is required", i)
-		}
-		if r.Topic == "" {
-			return fmt.Errorf("config: routes[%d].topic is required", i)
-		}
-		if !r.Broadcast && r.Target == "" {
-			return fmt.Errorf("config: routes[%d].target is required when not broadcast", i)
-		}
-	}
-
-	ruleNames := make(map[string]bool)
-	for i, r := range c.Rules {
-		if r.Name == "" {
-			return fmt.Errorf("config: rules[%d].name is required", i)
-		}
-		if ruleNames[r.Name] {
-			return fmt.Errorf("config: duplicate rule name %q", r.Name)
-		}
-		ruleNames[r.Name] = true
-		if r.Type == "" {
-			return fmt.Errorf("config: rules[%d].type is required", i)
+	for ruleID, threshold := range override.ThresholdOverrides {
+		if r, found := ruleIndex[ruleID]; found {
+			r.Threshold = threshold
 		}
 	}
 
+	// Build a set of disabled rule IDs for efficient lookup.
+	if len(override.Disabled) > 0 {
+		disabled := make(map[string]struct{}, len(override.Disabled))
+		for _, id := range override.Disabled {
+			disabled[id] = struct{}{}
+		}
+
+		kept := rp.Rules[:0]
+		for _, r := range rp.Rules {
+			if _, skip := disabled[r.RuleID]; !skip {
+				kept = append(kept, r)
+			}
+		}
+		rp.Rules = kept
+	}
+}
+
+// Validate checks every rule in the pack and returns the first error
+// encountered, if any.
+func (rp *RulePack) Validate() error {
+	for i := range rp.Rules {
+		if err := rp.Rules[i].Validate(); err != nil {
+			return err
+		}
+	}
 	return nil
-}
-
-// BuildBrokerOptions converts the config into BrokerOption slice.
-func (c *Config) BuildBrokerOptions() []BrokerOption {
-	var opts []BrokerOption
-	if c.Broker.QueueDepth > 0 {
-		opts = append(opts, WithQueueDepth(c.Broker.QueueDepth))
-	}
-	if c.Broker.Workers > 0 {
-		opts = append(opts, WithWorkers(c.Broker.Workers))
-	}
-	return opts
-}
-
-// BuildRuleChain creates a RuleChain from the rules config.
-func (c *Config) BuildRuleChain() (*RuleChain, error) {
-	chain := NewRuleChain()
-	for _, rc := range c.Rules {
-		rule, err := buildRuleFromConfig(rc)
-		if err != nil {
-			return nil, err
-		}
-		chain.AddRule(rule)
-	}
-	return chain, nil
-}
-
-// BuildRouter configures a TopicRouter from the routes config.
-func (c *Config) BuildRouter(broker *Broker) (*TopicRouter, error) {
-	router := NewTopicRouter(broker)
-	for _, r := range c.Routes {
-		if r.Broadcast {
-			if err := router.AddBroadcastRoute(r.Source, r.Topic); err != nil {
-				return nil, fmt.Errorf("config: route %s->broadcast: %w", r.Source, err)
-			}
-		} else {
-			if err := router.AddRoute(r.Source, r.Target, r.Topic); err != nil {
-				return nil, fmt.Errorf("config: route %s->%s: %w", r.Source, r.Target, err)
-			}
-		}
-	}
-	return router, nil
-}
-
-// BuildAgents creates agent mailboxes from the agents config.
-func (c *Config) BuildAgents(broker *Broker) (map[string]AgentMailbox, error) {
-	agents := make(map[string]AgentMailbox, len(c.Agents))
-	for _, ac := range c.Agents {
-		var opts []AgentOption
-		if ac.ChatID != "" {
-			opts = append(opts, WithAgentChatID(ac.ChatID))
-		}
-		if ac.BufferSize > 0 {
-			opts = append(opts, WithBufferSize(ac.BufferSize))
-		}
-		mb, err := NewAgentMailbox(broker, ac.Name, AgentType(ac.Type), opts...)
-		if err != nil {
-			// Cleanup on failure
-			for _, a := range agents {
-				a.Close()
-			}
-			return nil, fmt.Errorf("config: agent %s: %w", ac.Name, err)
-		}
-		agents[ac.Name] = mb
-	}
-	return agents, nil
-}
-
-// MarshalConfig serializes a Config to YAML bytes.
-func MarshalConfig(cfg *Config) ([]byte, error) {
-	return yaml.Marshal(cfg)
-}
-
-func buildRuleFromConfig(rc RuleConfig) (Rule, error) {
-	switch rc.Type {
-	case "filter_by_type":
-		if len(rc.AllowedTypes) == 0 {
-			return nil, fmt.Errorf("config: rule %q: filter_by_type requires allowed_types", rc.Name)
-		}
-		return FilterByTypeRule(rc.AllowedTypes...), nil
-
-	case "filter_by_sender":
-		if len(rc.AllowedSenders) == 0 {
-			return nil, fmt.Errorf("config: rule %q: filter_by_sender requires allowed_senders", rc.Name)
-		}
-		return FilterBySenderRule(rc.AllowedSenders...), nil
-
-	case "max_content_length":
-		if rc.MaxLength <= 0 {
-			return nil, fmt.Errorf("config: rule %q: max_content_length requires max_length > 0", rc.Name)
-		}
-		return MaxContentLengthRule(rc.MaxLength), nil
-
-	case "priority_boost":
-		if rc.BoostPriority <= 0 {
-			return nil, fmt.Errorf("config: rule %q: priority_boost requires boost_priority > 0", rc.Name)
-		}
-		allowedTypes := make(map[string]bool, len(rc.BoostTypes))
-		for _, t := range rc.BoostTypes {
-			allowedTypes[t] = true
-		}
-		return PriorityBoostRule(rc.Name, func(evt Event) bool {
-			if len(allowedTypes) == 0 {
-				return true
-			}
-			return allowedTypes[evt.Type]
-		}, Priority(rc.BoostPriority)), nil
-
-	case "metadata_enrich":
-		if len(rc.Enrichments) == 0 {
-			return nil, fmt.Errorf("config: rule %q: metadata_enrich requires enrichments", rc.Name)
-		}
-		return MetadataEnrichRule(rc.Name, rc.Enrichments), nil
-
-	case "conditional_route":
-		if rc.RouteTo == "" {
-			return nil, fmt.Errorf("config: rule %q: conditional_route requires route_to", rc.Name)
-		}
-		allowedTypes := make(map[string]bool, len(rc.RouteTypes))
-		for _, t := range rc.RouteTypes {
-			allowedTypes[t] = true
-		}
-		return ConditionalRouteRule(rc.Name, func(evt Event) bool {
-			if len(allowedTypes) == 0 {
-				return true
-			}
-			return allowedTypes[evt.Type]
-		}, rc.RouteTo), nil
-
-	default:
-		return nil, fmt.Errorf("config: rule %q: unknown type %q", rc.Name, rc.Type)
-	}
 }

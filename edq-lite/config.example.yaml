@@ -1,0 +1,84 @@
+version: "1.0.0"
+dataset_id: "altdata.creditbureaufeatures"
+entity: "credit_bureau_record"
+owner: "data-quality-team"
+tags: ["credit", "bureau", "altdata"]
+
+sla:
+  batch_window_min: 60
+  rt_latency_ms: 200
+  alert_channel: "#dq-alerts"
+
+rules:
+  - rule_id: "CB-COMP-001"
+    dataset_id: "altdata.creditbureaufeatures"
+    rule_type: "completeness"
+    entity: "credit_bureau_record"
+    field: "credit_score"
+    severity: "critical"
+    owner: "data-quality-team"
+    threshold: 0.995
+    params: {}
+
+  - rule_id: "CB-VAL-001"
+    dataset_id: "altdata.creditbureaufeatures"
+    rule_type: "validity"
+    entity: "credit_bureau_record"
+    field: "bureau"
+    severity: "high"
+    owner: "data-quality-team"
+    threshold: 0.99
+    params:
+      allowed_values: ["experian", "equifax", "transunion"]
+
+  - rule_id: "CB-RNG-001"
+    dataset_id: "altdata.creditbureaufeatures"
+    rule_type: "range"
+    entity: "credit_bureau_record"
+    field: "credit_score"
+    severity: "high"
+    owner: "data-quality-team"
+    threshold: 0.99
+    params:
+      min: 300
+      max: 850
+
+  - rule_id: "CB-UNQ-001"
+    dataset_id: "altdata.creditbureaufeatures"
+    rule_type: "uniqueness"
+    entity: "credit_bureau_record"
+    field: "customer_id"
+    severity: "critical"
+    owner: "data-quality-team"
+    threshold: 1.0
+    params: {}
+
+  - rule_id: "CB-VOL-001"
+    dataset_id: "altdata.creditbureaufeatures"
+    rule_type: "volume"
+    entity: "credit_bureau_record"
+    severity: "medium"
+    owner: "data-quality-team"
+    threshold: 1.0
+    params:
+      min_rows: 100
+      max_rows: 10000
+
+  - rule_id: "CB-TML-001"
+    dataset_id: "altdata.creditbureaufeatures"
+    rule_type: "timeliness"
+    entity: "credit_bureau_record"
+    severity: "high"
+    owner: "data-quality-team"
+    threshold: 0.95
+    params:
+      max_latency_sec: 3600
+      timestamp_field: "ingestion_ts"
+
+environment:
+  staging:
+    threshold_overrides:
+      CB-COMP-001: 0.95
+    disabled:
+      - CB-TML-001
+  production: {}

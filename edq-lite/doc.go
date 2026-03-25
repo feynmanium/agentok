@@ -1,81 +1,38 @@
-// Package edqlite implements EDQ Lite (Event-Driven Queue Lite), a lightweight,
-// pure-Go event-driven message queue designed for multi-agent communication
-// in the Agentok Studio platform.
+// Package edqlite implements EDQ Lite — a lightweight, deterministic data-quality
+// rule engine for batch and selective near-real-time entry points.
 //
-// # Software Design Document
+// # Purpose
 //
-// ## Purpose and Scope
+// Provide standardized, auditable hard-rule checks against tabular records,
+// producing structured results suitable for DPA evidence, governance dashboards,
+// and downstream alerting. EDQ Lite is an engine only; scheduling, triggering,
+// and result distribution are owned by consuming services.
 //
-// EDQ Lite provides an embeddable, zero-dependency event-driven message queue
-// that models Agentok Studio's agent communication patterns. It is designed to
-// be used either as an in-process library or as a standalone service via its
-// HTTP API.
+// # Rule Types
 //
-// ## Architecture Overview
+//   - Completeness: non-null thresholds on required fields
+//   - Validity/Domain: membership in enumerations or reference sets
+//   - Range/Bounds: min/max or vendor-aligned windows per field
+//   - Uniqueness: primary/business key uniqueness per entity
+//   - Timeliness: max ingestion-to-availability latency
+//   - VolumeSanity: expected row-count bands
+//   - Comparison: cross-record or cross-field equality/consistency checks
 //
-// The system is composed of six core components:
+// # Execution Modes
 //
-//   - Event: The fundamental unit of communication, carrying sender/receiver
-//     metadata, typed content, priority, and arbitrary metadata. Maps directly
-//     to Agentok's Message model.
+//   - Batch: evaluate rule packs against full datasets (primary mode)
+//   - NearRT: evaluate a rule subset against individual records with
+//     circuit-breaker protection and latency budgets
 //
-//   - Topic: A hierarchical, dot-separated namespace for routing events.
-//     Supports NATS-style wildcards: "*" matches a single segment, ">" matches
-//     one or more trailing segments.
+// # Output Contract
 //
-//   - Subscription: Binds a handler function to a topic pattern with an
-//     optional filter predicate for fine-grained event selection.
+// Every run produces a RunResult containing a RunHeader, per-rule RuleResult
+// entries with pass/fail status and violation samples, and aggregate metrics.
+// Results are JSON-serializable for storage in canonical audit locations.
 //
-//   - Broker: The central dispatch engine. Accepts published events into a
-//     priority queue, dispatches them via a pool of worker goroutines to
-//     matching subscriptions. Thread-safe for concurrent use.
+// # Configuration
 //
-//   - AgentMailbox: A higher-level abstraction providing send/receive semantics
-//     for individual agents, aligned with Agentok's sender/receiver model.
-//
-//   - TopicRouter: A rule-based routing table that maps agent-to-agent
-//     communication edges (as defined in Agentok flow graphs) to topics.
-//
-// ## Topic Naming Convention
-//
-//	chat.{chatID}.agent.{name}     -- direct messages to a specific agent
-//	chat.{chatID}.broadcast        -- broadcast to all agents in a chat
-//	chat.{chatID}.system           -- system events (status, errors)
-//	chat.{chatID}.group.{name}     -- group chat messages
-//	agent.{name}.>                 -- all events involving a specific agent
-//
-// ## Concurrency Model
-//
-// The Broker uses a buffered channel as the ingest point for published events.
-// A configurable number of worker goroutines drain this channel, insert events
-// into a heap-based priority queue, and fan out to matching subscriptions.
-// The subscription registry is protected by sync.RWMutex to allow concurrent
-// reads during dispatch while serializing subscription mutations.
-//
-// ## Priority Dispatch
-//
-// Events are ordered by priority (descending) then by creation time (ascending,
-// FIFO within the same priority tier). Four priority levels are defined:
-// Low (0), Normal (5), High (10), and Urgent (15).
-//
-// ## HTTP API
-//
-// The optional HTTP layer exposes:
-//
-//	POST   /api/v1/events              -- publish an event
-//	GET    /api/v1/events/stream       -- SSE stream filtered by topic pattern
-//	GET    /api/v1/topics              -- list active topics with subscriber counts
-//	POST   /api/v1/agents              -- register an agent mailbox
-//	DELETE /api/v1/agents/{name}       -- deregister an agent
-//	POST   /api/v1/agents/{name}/send  -- send from an agent
-//	GET    /api/v1/agents/{name}/receive -- SSE stream for an agent
-//	GET    /api/v1/health              -- health check
-//
-// ## Integration with Agentok
-//
-// Event.Sender and Event.Receiver map to Agentok flow node names. Event.Type
-// mirrors Agentok message types (user, assistant, summary, system, tool_call,
-// tool_response). Chat IDs scope topics to individual conversation sessions.
-// The TopicRouter can be configured from an Agentok flow graph's edge list to
-// automatically route agent-to-agent messages.
+// Rule packs are declared in YAML with dataset metadata, SLA targets, and
+// environment overrides. The engine uses semantic versioning for rule packs
+// and its own runtime version.
 package edqlite
